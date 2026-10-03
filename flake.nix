@@ -51,6 +51,28 @@
         marisa-trie pydantic llguidance
       ];
 
+      # The HIP extension is its own derivation with only its sources as input: Python, README or
+      # test edits do not recompile it (the compile takes ~25 min on 8 threads)
+      exllamav3Ext = pkgs.stdenv.mkDerivation {
+        pname = "exllamav3-ext";
+        version = "1.5.1+rocm.${gpuTarget}";
+        src = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [ ./setup.py ./exllamav3/exllamav3_ext ];
+        };
+        nativeBuildInputs = [ pkgs.ninja (python.withPackages (p: [ p.setuptools p.ninja torch ])) ];
+        env = rocmEnv;
+        buildPhase = useRocmClang + ''
+          export MAX_JOBS=$NIX_BUILD_CORES
+          python setup.py build_ext --inplace
+        '';
+        installPhase = ''
+          install -Dm755 -t $out/${python.sitePackages} exllamav3_ext*.so
+        '';
+      };
+
+      # Pure-Python package (EXLLAMA_NOCOMPILE), rebuilt in seconds; the prebuilt extension is linked
+      # in as the top-level exllamav3_ext module that exllamav3/ext.py imports
       exllamav3 = pp.buildPythonPackage {
         pname = "exllamav3";
         version = "1.5.1+rocm.${gpuTarget}";
@@ -59,17 +81,13 @@
           root = ./.;
           fileset = lib.fileset.unions [ ./exllamav3 ./setup.py ./pyproject.toml ./README.md ./LICENSE ];
         };
-        build-system = [ pp.setuptools pp.wheel pp.ninja torch ];
-        nativeBuildInputs = [ pkgs.ninja ];
+        build-system = [ pp.setuptools pp.wheel ];
         dependencies = exlDeps pp;
-        env = rocmEnv;
-        preBuild = useRocmClang + ''
-          export MAX_JOBS=$NIX_BUILD_CORES
-        '';
-        # Importing the extension needs a GPU (absent in the build sandbox); check the .so instead
+        env.EXLLAMA_NOCOMPILE = "1";
+        # Importing the extension needs a GPU (absent in the build sandbox)
         doCheck = false;
         postInstall = ''
-          ls $out/${python.sitePackages}/exllamav3_ext*.so
+          ln -s ${exllamav3Ext}/${python.sitePackages}/exllamav3_ext*.so $out/${python.sitePackages}/
         '';
       };
 
@@ -200,6 +218,7 @@
     {
       packages.${system} = {
         inherit exllamav3 exllama;
+        exllamav3-ext = exllamav3Ext;
         tabbyapi = tabbyapiSrc;
         default = exllama;
       };

@@ -32,6 +32,11 @@ The original upstream README is kept as [README.exllamav3.md](README.exllamav3.m
   - Sampler fallbacks are Qwen's recommended thinking-mode settings (temperature 1.0, top_p 0.95,
     top_k 20, min_p 0, presence_penalty 0, repetition_penalty 1.0), applied when a request omits them;
     values sent by the client win.
+- The HIP extension is a separate package (`.#exllamav3-ext`) built only from `setup.py` and
+  `exllamav3/exllamav3_ext/`; it compiles once (~25 min on 8 threads) and is reused until those files, the
+  toolchain or `flake.lock` change. Python, README, test and serving-profile edits rebuild only the
+  pure-Python package (seconds). `nix run` keeps no GC root, so `nix-collect-garbage` would delete the
+  compiled extension; `nix build .#exllama -o result-exllama` (or `nix profile install .#exllama`) keeps it.
 - `nix develop` gives the same toolchain for development: build the extension in place with
   `python setup.py build_ext --inplace` (~25 min on 8 threads here), then run `rocm_tests/*` from the repo
   (the shell puts the repo on `PYTHONPATH`). If `USER` is not set in the environment (e.g. a sandboxed
