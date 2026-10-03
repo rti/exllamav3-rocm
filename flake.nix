@@ -90,6 +90,19 @@
       #   fast: DFlash2 draft, 128K shared pool;  ~62-104 tok/s single, 120K session + 8K side job fit
       #   long: MTP draft, 208K shared pool;      ~45-69 tok/s single, 180K session + 8K side job fit
       # The KV pool is shared and paged: one request may use (almost) all of it, two share it.
+      #
+      # Sampler fallbacks for requests that omit them: Qwen's recommended thinking-mode settings
+      # (model card; reasoning is on in both profiles). Not forced, so clients may override, e.g. with
+      # the non-thinking set: temperature 0.7, top_p 0.8, top_k 20, min_p 0, presence_penalty 1.5.
+      samplerPreset = "qwen-thinking";
+      samplerOverrides = pkgs.runCommand "tabby-sampler-overrides" { } ''
+        mkdir $out
+        cp ${tabbyapiSrc}/sampler_overrides/*.yml $out/
+        cp ${(pkgs.formats.yaml { }).generate "${samplerPreset}.yml" (lib.mapAttrs (_: v: { override = v; force = false; }) {
+          temperature = 1.0; top_p = 0.95; top_k = 20; min_p = 0.0;
+          presence_penalty = 0.0; repetition_penalty = 1.0;
+        })} $out/${samplerPreset}.yml
+      '';
       mkProfile = name: m: d: (pkgs.formats.yaml { }).generate "tabby-${name}.yml" {
         network = { host = "127.0.0.1"; port = 8096; disable_auth = true; api_servers = [ "OAI" ]; };
         logging = { log_prompt = false; log_generation_params = false; log_requests = false; };
@@ -101,7 +114,8 @@
           max_batch_size = 2;
           gpu_split_auto = true;
           autosplit_reserve = [ 512 ];
-          vision = false;
+          vision = true;
+          vision_offload = true;  # encoder weights in pinned system RAM: no VRAM left beside the KV pool
           reasoning = true;
           reasoning_start_token = "<think>";
           reasoning_end_token = "</think>";
@@ -109,6 +123,7 @@
         } // m;
         draft_model = { draft_cache_mode = "Q4"; } // d;
         memory.sysmem_recurrent_cache = 4096;
+        sampling.override_preset = samplerPreset;
       };
       profiles = {
         fast = mkProfile "fast"
@@ -168,7 +183,7 @@
           # relative to the working directory: run it from a writable state dir
           mkdir -p "$state"
           ln -sfn ${tabbyapiSrc}/templates "$state/templates"
-          ln -sfn ${tabbyapiSrc}/sampler_overrides "$state/sampler_overrides"
+          ln -sfn ${samplerOverrides} "$state/sampler_overrides"
           ln -sfn "$config" "$state/config.yml"
           ln -sfn "$models" "$state/models"
           cd "$state"

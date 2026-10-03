@@ -27,6 +27,11 @@ The original upstream README is kept as [README.exllamav3.md](README.exllamav3.m
   - `long`: MTP draft, 208K-token pool.
   - Defaults: models from `$EXLLAMA_MODELS` or `./models`, main model `Qwen3.8-27B-exl3-SC4.0`, draft
     `Qwen3.8-27B-DFlash2-EXL3-5.0bpw`.
+  - Vision is on, with the encoder weights kept in system RAM (`vision_offload`): image requests work in
+    both profiles without taking VRAM from the KV pool.
+  - Sampler fallbacks are Qwen's recommended thinking-mode settings (temperature 1.0, top_p 0.95,
+    top_k 20, min_p 0, presence_penalty 0, repetition_penalty 1.0), applied when a request omits them;
+    values sent by the client win.
 - `nix develop` gives the same toolchain for development: build the extension in place with
   `python setup.py build_ext --inplace` (~25 min on 8 threads here), then run `rocm_tests/*` from the repo
   (the shell puts the repo on `PYTHONPATH`). If `USER` is not set in the environment (e.g. a sandboxed
