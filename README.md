@@ -14,10 +14,100 @@ The original upstream README is kept as [README.exllamav3.md](README.exllamav3.m
 
 ---
 
+## Nix flake and 4.0 bpw results
+
+`flake.nix` (with `flake.lock`) builds the whole stack reproducibly: pinned nixpkgs, Python 3.13, PyTorch
+2.11 with ROCm 7.2.3, the extension for `gfx1100`, and TabbyAPI (pinned commit, with
+`rocm/tabbyapi/0001-exllamav3-allow-rdna3.patch` applied).
+
+- `nix run . -- [--profile fast|long] [--models DIR] [--model NAME] [--draft NAME] [--state DIR]` starts
+  TabbyAPI's OpenAI endpoint on `127.0.0.1:8096` (no auth), 8-bit KV cache, prefill chunk 2048, two
+  concurrent requests sharing one paged KV pool. Remaining arguments go to TabbyAPI.
+  - `fast` (default): DFlash2 draft, 128K-token pool.
+  - `long`: MTP draft, 208K-token pool.
+  - Defaults: models from `$EXLLAMA_MODELS` or `./models`, main model `Qwen3.8-27B-exl3-SC4.0`, draft
+    `Qwen3.8-27B-DFlash2-EXL3-5.0bpw`.
+- `nix develop` gives the same toolchain for development: build the extension in place with
+  `python setup.py build_ext --inplace` (~25 min on 8 threads here), then run `rocm_tests/*` from the repo
+  (the shell puts the repo on `PYTHONPATH`). If `USER` is not set in the environment (e.g. a sandboxed
+  runner), PyTorch fails with `No username set in the environment`; set `USER`/`LOGNAME` or
+  `TORCHINDUCTOR_CACHE_DIR`.
+
+All results in this section use the main model `Qwen3.8-27B-exl3-SC4.0` (EXL3 4.0 bpw, `mul1` codebook,
+5-bit head, 4-bit MTP head, 15.6 GB), the flake devShell (Python 3.13, PyTorch 2.11 + ROCm 7.2.3), 8-bit
+KV cache and 4-bit DFlash2 draft KV cache. Single runs; run-to-run variance is 10-20% (see
+[Results](#results-rx-7900-xtx-24-gb-rocm-724-pytorch-2130rocm72)).
+
+### Single stream
+
+```
+python rocm_tests/bench_long.py 2000,32000,99000 -m models/Qwen3.8-27B-exl3-SC4.0 -dm models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw --cache 131072
+python rocm_tests/bench_long.py 2000,32000,99000 -m models/Qwen3.8-27B-exl3-SC4.0 --mtp --cache 212992
+python rocm_tests/bench_gen.py -m models/Qwen3.8-27B-exl3-SC4.0 -dm models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw --cache 131072 --kv_bits 8 --dkv_bits 4 --temp 0 --prompts code,explain,prose
+python rocm_tests/bench_gen.py -m models/Qwen3.8-27B-exl3-SC4.0 --mtp -ndt 3 --cache 212992 --kv_bits 8 --temp 0 --prompts code,explain,prose
+```
+
+Decode after a long code-style prompt, greedy (`bench_long.py`, 256 generated tokens):
+
+| Context | fast: DFlash2, 128K cache | long: MTP, 208K cache |
+|---|---|---|
+| 2K | 93.1 tok/s (draft 192/448) | 82.7 tok/s (draft 184/288) |
+| 32K | 130.9 tok/s (draft 212/308) | 84.0 tok/s (draft 188/272) |
+| 99K | 87.7 tok/s (draft 204/364) | 64.8 tok/s (draft 188/272) |
+| Prefill 2K / 32K / 99K | 1033 / 1155 / 921 tok/s | 1054 / 1140 / 901 tok/s |
+
+Short prompts, 512 generated tokens, greedy (`bench_gen.py`):
+
+| Workload | fast: DFlash2 | long: MTP (3 draft tokens) |
+|---|---|---|
+| Code | 126.8 tok/s (accept 0.57) | 93.4 tok/s (accept 0.78) |
+| Explanation | 88.0 tok/s (accept 0.35) | 79.0 tok/s (accept 0.61) |
+| Prose / story | 62.3 tok/s (accept 0.21) | 59.0 tok/s (accept 0.37) |
+| Mean | 92.4 tok/s | 77.1 tok/s |
+| VRAM allocated after load | 20.16 GiB | 20.82 GiB |
+
+- Compared with the 3.5 bpw results further down (measured with PyTorch 2.13, so model and stack both
+  differ): short prompts are 3-19% slower; long-context decode is 11-41% slower with DFlash2 and 2-23%
+  slower with MTP. A 4.0 bpw model reads more weight bytes per token, which would explain part of this
+  (not profiled).
+- The 2K DFlash2 run is slower than the 32K one, most likely because fewer drafts were accepted on that
+  generated text (192/448 vs 212/308).
+
+### Two concurrent long-context jobs (`rocm_tests/bench_slots.py`)
+
+Two jobs share one paged KV pool, as in the flake's serving profiles. Job 0 has a long prompt of real
+source code from this repo and generates 1500 tokens; job 1 (8K prompt, 512 tokens) arrives after job 0
+has decoded 100 tokens (`--stagger 100 --task code`, temperature 0.6). Run from `rocm_tests/`:
+
+```
+python bench_slots.py --cache 131072 --prompt 120000,8000 --tokens 1500,512 --stagger 100 --task code -dm ../models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw
+python bench_slots.py --cache 212992 --prompt 120000,8000 --tokens 1500,512 --stagger 100 --task code --mtp
+```
+
+| | fast: DFlash2, 128K pool | long: MTP, 208K pool |
+|---|---|---|
+| VRAM after load / peak | 22.96 / 23.98 GiB | 22.40 / 23.98 GiB |
+| Job 0 (120K prompt): TTFT, decode | 143 s, 53.3 tok/s (draft 1215/1995) | 146 s, 46.5 tok/s (draft 1147/1412) |
+| Job 1 (8K prompt): TTFT, decode | 9.5 s, 67.5 tok/s (draft 416/672) | 7.0 s, 45.0 tok/s (draft 377/540) |
+| Job 0 alone, before job 1 | 53.1 tok/s | 52.5 tok/s |
+| Job 0 during job 1 prefill | 1.4 tok/s (stalls ~9.5 s) | 2.6 tok/s (stalls ~7 s) |
+| Job 0 while both decode | 55.2 tok/s | 51.7 tok/s |
+| Job 0 alone, after job 1 | 105.5 tok/s | 66.1 tok/s |
+
+- Prefill of the 120K prompt runs at ~820-840 tok/s. A second job's prefill nearly stops the first job's
+  decode for its duration (8K prompt: 7-10 s); after that both jobs decode at roughly single-job speed each.
+- The long profile with an 8K + 8K pair decodes at 44.3 / 50.0 tok/s per job (88.9 tok/s aggregate).
+- **The long profile does not fit a 160K or 180K first job** in this benchmark (the comment in `flake.nix`
+  says 180K + 8K fit): job 0 hits a HIP out-of-memory error during prefill (512 MiB request with 438 MiB
+  free and 1.04 GiB reserved but unallocated). 120K + 8K fits.
+
+---
+
+
 ## Results (RX 7900 XTX 24 GB, ROCm 7.2.4, PyTorch 2.13.0+rocm7.2)
 
-Decode speed, greedy, code-style prompt, 8-bit KV cache (DFlash2 draft KV 4-bit), measured with
-`rocm_tests/bench_long.py` after a prompt of the given length:
+Decode speed with the 3.5 bpw main model (`Qwen3.8-27B-EXL3-3.5bpw`), greedy, code-style prompt, 8-bit KV
+cache (DFlash2 draft KV 4-bit), measured with `rocm_tests/bench_long.py` after a prompt of the given length:
 
 | Context | DFlash2 (default) | MTP | No draft |
 |---|---|---|---|
@@ -50,7 +140,7 @@ For reference, the same GPU with llama.cpp (Qwen3.8-27B IQ3_XXS GGUF + DFlash2 Q
 40-53 tok/s.
 
 Speculative decoding speed depends on the text: drafts are accepted far more often on code than on free
-prose. All numbers are single-stream (batch size 1).
+prose. All numbers in this section are single-stream (batch size 1).
 
 ## Models
 
@@ -232,6 +322,7 @@ verification from ~45 ms to ~14 ms per round.
 | `gaps.py -m <model> [-dm <draft>] [--stack]` | GPU busy/idle per speculative round, gap histogram, kernel counts and times; `--stack`: CPU activity inside large GPU gaps |
 | `bench_gen.py -m <model> [-dm <draft> \| --mtp]` | short-prompt generation speed, draft acceptance, `--image` for vision |
 | `bench_long.py 2000,32000,99000 [-dm <draft> \| --mtp]` | decode speed after long prompts (greedy, prints output with `--show`) |
+| `bench_slots.py --cache N --prompt 120000,8000 [--stagger 100] [-dm <draft> \| --mtp]` | concurrent jobs sharing one paged KV pool; with `--stagger`, job 0's decode rate per phase (alone / during job 1 prefill / both decoding / alone again) |
 | `prof_gen.py`, `prof_long.py`, `prof_prefill.py` | kernel-time breakdowns (torch.profiler) |
 | `kbench.cc` | standalone EXL3 matmul timing harness (`hipcc -x hip`; warms the clocks first; `-DKB_TRACE` prints a per-block timeline) |
 | `attn_pf_bench.py` | prefill attention microbenchmark with a torch reference |

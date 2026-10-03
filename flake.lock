@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1790450978,
+        "narHash": "sha256-/eLCD/X9kaWJqPR47+fDozEC87Hjmm3i8gJbYmDAD7g=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "5e2305d577ca00acbba631b05cb1094d172b29f3",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "5e2305d577ca00acbba631b05cb1094d172b29f3",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "tabbyapi": "tabbyapi"
+      }
+    },
+    "tabbyapi": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790041607,
+        "narHash": "sha256-ClMKySngQibacFS9vaDYmAQJo3rUznMIBLH35VdbZe8=",
+        "owner": "theroyallab",
+        "repo": "tabbyAPI",
+        "rev": "f07131cd8fe34e449fe87cdd3a066b52b96d3cac",
+        "type": "github"
+      },
+      "original": {
+        "owner": "theroyallab",
+        "repo": "tabbyAPI",
+        "rev": "f07131cd8fe34e449fe87cdd3a066b52b96d3cac",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
