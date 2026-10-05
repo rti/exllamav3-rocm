@@ -185,7 +185,7 @@
                        long:           MTP drafting
                        plain:          no drafting
                        2 slots share one KV pool sized per model and profile (table below)
-            --model    main model key (default: sc4):
+            --model    main model key (default: swift35):
           ${modelHelp}
             --models   directory holding the model folders   (default: \$EXLLAMA_MODELS or ./models)
             --draft    DFlash2 draft folder name (fast only)  (default: Qwen3.8-27B-DFlash2-EXL3-5.0bpw)
@@ -197,7 +197,7 @@
           }
           profile=fast
           models=''${EXLLAMA_MODELS:-$PWD/models}
-          model=sc4
+          model=swift35
           draft=Qwen3.8-27B-DFlash2-EXL3-5.0bpw
           state=''${XDG_STATE_HOME:-$HOME/.local/state}/exllama
           passthru=()
