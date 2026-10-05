@@ -103,14 +103,29 @@
         setuptools formatron kbnf
       ]));
 
-      # Serving profiles, measured on a 7900 XTX with the turboderp 4.0bpw quant (SC_4.00bpw_H5)
-      # and two concurrent coding jobs (see rocm_tests/bench_slots.py):
-      #   fast: DFlash2 draft, 128K shared pool;  ~62-104 tok/s single, 120K session + 8K side job fit
-      #   long: MTP draft, 208K shared pool;      ~45-69 tok/s single, 180K session + 8K side job fit
-      # The KV pool is shared and paged: one request may use (almost) all of it, two share it.
-      #
+      # Serving profiles: one TabbyAPI config per main model and drafting mode. The KV pool is shared
+      # and paged: one request may use (almost) all of it, two share it. Pool sizes (tokens, Q8 KV,
+      # 2 slots, vision in system RAM, DFlash2 KV Q4) are the largest that survive prefill of a near-full
+      # pool on a 7900 XTX, from rocm_tests/bench_slots.py runs and measured per-model free VRAM
+      # (README "Model comparison"):
+      #   fast:  DFlash2 draft  (fastest decode; draft KV + 1.6 GB of draft weights cost context)
+      #   long:  MTP draft      (built-in head, ~1/4 slower than fast on code, more context)
+      #   plain: no drafting    (~40 tok/s; most context, capped at 256K per request)
+      mainModels = {
+        sc4     = { dir = "Qwen3.8-27B-exl3-SC4.0";                      fast = 124; long = 192; plain = 244; };
+        mia35   = { dir = "Qwen3.8-27B-EXL3-3.5bpw";                     fast = 160; long = 232; plain = 276; };
+        swift35 = { dir = "Swift-1.5-Qwen3.8-27B-exl3-SC_3.50bpw_H4_V6"; fast = 172; long = 240; plain = 292; };
+        swift40 = { dir = "Swift-1.5-Qwen3.8-27B-exl3-SC_4.00bpw_H5_V6"; fast = 120; long = 192; plain = 236; };
+      };
+      draftModes = {
+        fast = { draft_mode = "model"; draft_model_dir = "models"; };
+        long = { draft_mode = "mtp"; };
+        plain = { };
+      };
+      maxSeqLen = 262144;  # max_position_embeddings of Qwen3.8
+
       # Sampler fallbacks for requests that omit them: Qwen's recommended thinking-mode settings
-      # (model card; reasoning is on in both profiles). Not forced, so clients may override, e.g. with
+      # (model card; reasoning is on in every profile). Not forced, so clients may override, e.g. with
       # the non-thinking set: temperature 0.7, top_p 0.8, top_k 20, min_p 0, presence_penalty 1.5.
       samplerPreset = "qwen-thinking";
       samplerOverrides = pkgs.runCommand "tabby-sampler-overrides" { } ''
@@ -121,36 +136,41 @@
           presence_penalty = 0.0; repetition_penalty = 1.0;
         })} $out/${samplerPreset}.yml
       '';
-      mkProfile = name: m: d: (pkgs.formats.yaml { }).generate "tabby-${name}.yml" {
-        network = { host = "127.0.0.1"; port = 8096; disable_auth = true; api_servers = [ "OAI" ]; };
-        logging = { log_prompt = false; log_generation_params = false; log_requests = false; };
-        model = {
-          model_dir = "models";
-          backend = "exllamav3";
-          cache_mode = "Q8";
-          chunk_size = 2048;
-          max_batch_size = 2;
-          gpu_split_auto = true;
-          autosplit_reserve = [ 512 ];
-          vision = true;
-          vision_offload = true;  # encoder weights in pinned system RAM: no VRAM left beside the KV pool
-          reasoning = true;
-          reasoning_start_token = "<think>";
-          reasoning_end_token = "</think>";
-          tool_format = "qwen3_coder";
-        } // m;
-        draft_model = { draft_cache_mode = "Q4"; } // d;
-        memory.sysmem_recurrent_cache = 4096;
-        sampling.override_preset = samplerPreset;
-      };
-      profiles = {
-        fast = mkProfile "fast"
-          { cache_size = 131072; max_seq_len = 131072; }
-          { draft_mode = "model"; draft_model_dir = "models"; };
-        long = mkProfile "long"
-          { cache_size = 212992; max_seq_len = 212992; }
-          { draft_mode = "mtp"; };
-      };
+      mkProfile = key: mode: let pool = mainModels.${key}.${mode} * 1024; in
+        (pkgs.formats.yaml { }).generate "tabby-${key}-${mode}.yml" ({
+          network = { host = "127.0.0.1"; port = 8096; disable_auth = true; api_servers = [ "OAI" ]; };
+          logging = { log_prompt = false; log_generation_params = false; log_requests = false; };
+          model = {
+            model_dir = "models";
+            backend = "exllamav3";
+            cache_mode = "Q8";
+            cache_size = pool;
+            max_seq_len = lib.min pool maxSeqLen;
+            chunk_size = 2048;
+            max_batch_size = 2;
+            gpu_split_auto = true;
+            autosplit_reserve = [ 512 ];
+            vision = true;
+            vision_offload = true;  # encoder weights in pinned system RAM: no VRAM left beside the KV pool
+            reasoning = true;
+            reasoning_start_token = "<think>";
+            reasoning_end_token = "</think>";
+            tool_format = "qwen3_coder";
+          };
+          memory.sysmem_recurrent_cache = 4096;
+          sampling.override_preset = samplerPreset;
+        } // lib.optionalAttrs (draftModes.${mode} != { }) {
+          draft_model = { draft_cache_mode = "Q4"; } // draftModes.${mode};
+        });
+      # Shell case arms "<model>:<mode>) dir=...; config=...; pool=... ;;" for every combination
+      profileCases = lib.concatStrings (lib.flatten (lib.mapAttrsToList (key: m:
+        map (mode: ''
+          ${key}:${mode}) dir=${m.dir}; config=${mkProfile key mode}; pool=${toString m.${mode}}K ;;
+        '') (lib.attrNames draftModes)) mainModels));
+      pad = n: s: s + lib.fixedWidthString (n - lib.stringLength s) " " "";
+      modelHelp = lib.concatStrings (lib.mapAttrsToList (key: m: ''
+        ${pad 9 key}${pad 45 m.dir}fast ${toString m.fast}K, long ${toString m.long}K, plain ${toString m.plain}K
+      '') mainModels);
 
       exllama = pkgs.writeShellApplication {
         name = "exllama";
@@ -158,13 +178,16 @@
         text = ''
           usage() {
             cat <<EOF
-          usage: exllama [--profile fast|long] [--models DIR] [--model NAME] [--draft NAME]
+          usage: exllama [--profile fast|long|plain] [--model KEY] [--models DIR] [--draft NAME]
                          [--state DIR] [TABBYAPI-ARGS...]
 
-            --profile  fast (default): DFlash2 drafting, 2 slots sharing a 128K-token KV pool
-                       long:           MTP drafting,     2 slots sharing a 208K-token KV pool
+            --profile  fast (default): DFlash2 drafting
+                       long:           MTP drafting
+                       plain:          no drafting
+                       2 slots share one KV pool sized per model and profile (table below)
+            --model    main model key (default: sc4):
+          ${modelHelp}
             --models   directory holding the model folders   (default: \$EXLLAMA_MODELS or ./models)
-            --model    main model folder name                 (default: Qwen3.8-27B-exl3-SC4.0)
             --draft    DFlash2 draft folder name (fast only)  (default: Qwen3.8-27B-DFlash2-EXL3-5.0bpw)
             --state    writable TabbyAPI state dir            (default: \''${XDG_STATE_HOME:-~/.local/state}/exllama)
 
@@ -174,7 +197,7 @@
           }
           profile=fast
           models=''${EXLLAMA_MODELS:-$PWD/models}
-          model=Qwen3.8-27B-exl3-SC4.0
+          model=sc4
           draft=Qwen3.8-27B-DFlash2-EXL3-5.0bpw
           state=''${XDG_STATE_HOME:-$HOME/.local/state}/exllama
           passthru=()
@@ -189,13 +212,14 @@
               *) passthru+=("$1"); shift ;;
             esac
           done
-          case "$profile" in
-            fast) config=${profiles.fast}; passthru=(--draft-model-name "$draft" "''${passthru[@]}") ;;
-            long) config=${profiles.long} ;;
-            *) echo "unknown profile: $profile" >&2; usage >&2; exit 2 ;;
+          case "$model:$profile" in
+          ${profileCases}
+            *) echo "unknown model/profile: $model/$profile" >&2; usage >&2; exit 2 ;;
           esac
+          [ "$profile" = fast ] && passthru=(--draft-model-name "$draft" "''${passthru[@]}")
           models=$(realpath "$models")
-          [ -d "$models/$model" ] || { echo "model not found: $models/$model" >&2; exit 1; }
+          [ -d "$models/$dir" ] || { echo "model not found: $models/$dir" >&2; exit 1; }
+          echo "exllama: $dir, profile $profile, $pool KV pool" >&2
 
           # TabbyAPI resolves config.yml, templates/, sampler_overrides/, logs/ and api_tokens.yml
           # relative to the working directory: run it from a writable state dir
@@ -211,7 +235,7 @@
           # Compiled Triton kernels persist across restarts; also avoids torch's getpass() lookup
           export TRITON_CACHE_DIR=''${TRITON_CACHE_DIR:-$state/cache/triton}
           export TORCHINDUCTOR_CACHE_DIR=''${TORCHINDUCTOR_CACHE_DIR:-$state/cache/inductor}
-          exec ${serverPython}/bin/python ${tabbyapiSrc}/main.py --model-name "$model" "''${passthru[@]}"
+          exec ${serverPython}/bin/python ${tabbyapiSrc}/main.py --model-name "$dir" "''${passthru[@]}"
         '';
       };
     in

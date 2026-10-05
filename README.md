@@ -20,15 +20,24 @@ The original upstream README is kept as [README.exllamav3.md](README.exllamav3.m
 2.11 with ROCm 7.2.3, the extension for `gfx1100`, and TabbyAPI (pinned commit, with
 `rocm/tabbyapi/0001-exllamav3-allow-rdna3.patch` applied).
 
-- `nix run . -- [--profile fast|long] [--models DIR] [--model NAME] [--draft NAME] [--state DIR]` starts
-  TabbyAPI's OpenAI endpoint on `127.0.0.1:8096` (no auth), 8-bit KV cache, prefill chunk 2048, two
+- `nix run . -- [--profile fast|long|plain] [--model KEY] [--models DIR] [--draft NAME] [--state DIR]`
+  starts TabbyAPI's OpenAI endpoint on `127.0.0.1:8096` (no auth), 8-bit KV cache, prefill chunk 2048, two
   concurrent requests sharing one paged KV pool. Remaining arguments go to TabbyAPI.
-  - `fast` (default): DFlash2 draft, 128K-token pool.
-  - `long`: MTP draft, 208K-token pool.
-  - Defaults: models from `$EXLLAMA_MODELS` or `./models`, main model `Qwen3.8-27B-exl3-SC4.0`, draft
-    `Qwen3.8-27B-DFlash2-EXL3-5.0bpw`.
+  - `fast` (default): DFlash2 draft. `long`: MTP draft. `plain`: no drafting.
+  - `--model` picks the main model; the KV pool size depends on model and profile (see
+    [Model comparison](#model-comparison-35-vs-40-bpw-mtp-and-dflash2)):
+
+    | Key | Folder | fast | long | plain |
+    |---|---|---|---|---|
+    | `sc4` (default) | `Qwen3.8-27B-exl3-SC4.0` | 124K | 192K | 244K |
+    | `mia35` | `Qwen3.8-27B-EXL3-3.5bpw` | 160K | 232K | 276K |
+    | `swift35` | `Swift-1.5-Qwen3.8-27B-exl3-SC_3.50bpw_H4_V6` | 172K | 240K | 292K |
+    | `swift40` | `Swift-1.5-Qwen3.8-27B-exl3-SC_4.00bpw_H5_V6` | 120K | 192K | 236K |
+
+    One request is capped at 256K (`max_seq_len` 262144); a larger pool only helps two concurrent requests.
+  - Defaults: models from `$EXLLAMA_MODELS` or `./models`, draft `Qwen3.8-27B-DFlash2-EXL3-5.0bpw`.
   - Vision is on, with the encoder weights kept in system RAM (`vision_offload`): image requests work in
-    both profiles without taking VRAM from the KV pool.
+    every profile without taking VRAM from the KV pool.
   - Sampler fallbacks are Qwen's recommended thinking-mode settings (temperature 1.0, top_p 0.95,
     top_k 20, min_p 0, presence_penalty 0, repetition_penalty 1.0), applied when a request omits them;
     values sent by the client win.
@@ -107,9 +116,54 @@ python bench_slots.py --cache 212992 --prompt 120000,8000 --tokens 1500,512 --st
 - Prefill of the 120K prompt runs at ~820-840 tok/s. A second job's prefill nearly stops the first job's
   decode for its duration (8K prompt: 7-10 s); after that both jobs decode at roughly single-job speed each.
 - The long profile with an 8K + 8K pair decodes at 44.3 / 50.0 tok/s per job (88.9 tok/s aggregate).
-- **The long profile does not fit a 160K or 180K first job** in this benchmark (the comment in `flake.nix`
-  says 180K + 8K fit): job 0 hits a HIP out-of-memory error during prefill (512 MiB request with 438 MiB
-  free and 1.04 GiB reserved but unallocated). 120K + 8K fits.
+- **The old long profile (208K pool) does not fit a 160K or 180K first job** in this benchmark: job 0 hits a
+  HIP out-of-memory error during prefill (512 MiB request with 438 MiB free and 1.04 GiB reserved but
+  unallocated). 120K + 8K fits. The long profile for this model is now 192K, which fits 172K + 8K.
+
+## Model comparison: 3.5 vs 4.0 bpw, MTP and DFlash2
+
+Main models (all Qwen3.8-27B EXL3, `models/`):
+
+| Key | Repository | Body / head bpw | Size |
+|---|---|---|---|
+| `sc4` | turboderp/Qwen3.8-27B-exl3 (SC 4.0) | 4.02 / 5 | 16 GB |
+| `mia35` | [Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw](https://huggingface.co/Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw) | 3.52 / 6 | 15 GB |
+| `swift35` | [erlidev/Swift-1.5-Qwen3.8-27B-EXL3](https://huggingface.co/erlidev/Swift-1.5-Qwen3.8-27B-EXL3) `SC_3.50bpw_H4_V6` | 3.5 / 4 | 14.7 GB |
+| `swift40` | same, branch `SC_4.00bpw_H5_V6` | 4.0 / 5 | 16.4 GB |
+
+Swift 1.5 is a fine-tune (RL + distillation) of Qwen3.8-27B; download a branch with
+`hf download erlidev/Swift-1.5-Qwen3.8-27B-EXL3 --revision SC_3.50bpw_H4_V6 --local-dir models/Swift-1.5-Qwen3.8-27B-exl3-SC_3.50bpw_H4_V6`.
+
+Decode speed, tok/s, code / explain task (`bench_slots.py --cache 16384 --prompt 4000 --tokens 1024`,
+temperature 0.6, mean of 2 runs; drafted runs vary by ±10 tok/s):
+
+| | plain | MTP | DFlash2 |
+|---|---|---|---|
+| `sc4` | 38.8 / 38.8 | 101.2 / 87.2 | 129.8 / 88.7 |
+| `mia35` | 41.3 / 41.2 | 104.6 / 88.8 | 141.5 / 105.7 |
+| `swift35` | 42.2 / 42.0 | 106.1 / 90.5 | 133.6 / 103.2 |
+| `swift40` | 39.0 / 39.0 | 101.9 / 86.7 | 134.9 / 99.6 |
+
+- Draft acceptance on the Swift fine-tune matches the base model (code: ~75% MTP, ~60-65% DFlash2), so
+  the base-model DFlash2 drafter works for Swift.
+- Prefill is the same for 3.5 and 4.0 bpw (~1400 tok/s at 4K, ~1325 at 16K, `eval/perf.py`).
+
+Wikitext-2 perplexity (`eval/ppl.py -r 100 -l 2048`): `sc4` 7.005, `mia35` 7.080, `swift35` 7.062,
+`swift40` 7.194. For Swift this partly measures distance from the base model, not quantization loss;
+`swift40` scoring worse than `swift35` was not investigated.
+
+KV pool sizing (Q8 main KV, 2 slots, vision offloaded, DFlash2 KV Q4):
+
+- Main KV 34 MiB per 1K tokens; MTP adds 1.1 MiB per 1K and 0.2 GiB weights; DFlash2 adds 5.6 MiB per
+  1K and 1.57 GiB weights. Drafting also enlarges the recurrent-state history (`max_history`): +1.1 GiB
+  with MTP, +2.0 GiB with DFlash2.
+- Prefill near a full pool needs ~2 GiB of free VRAM beyond the cache: `swift35` MTP fits 240K
+  (212K + 8K jobs) but runs out of memory at 252K (224K + 8K).
+- Pool sizes for the other models are scaled from the per-model free VRAM measured after load. Checked with
+  near-full two-job runs: `swift35` plain 292K (252K + 8K), `swift35` fast 172K (160K + 8K), `sc4` long
+  192K (172K + 8K), `sc4` fast 124K (112K + 8K).
+- 3.5 vs 4.0 bpw: the 3.5 bpw Swift quant gives 48K more context with MTP, 52K with DFlash2 and 56K
+  without drafting.
 
 ---
 
